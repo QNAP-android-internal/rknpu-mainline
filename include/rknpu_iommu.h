@@ -25,8 +25,9 @@ enum iommu_dma_cookie_type {
 };
 
 struct rknpu_iommu_dma_cookie {
+#if KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE
 	enum iommu_dma_cookie_type type;
-
+#endif
 	/* Full allocator for IOMMU_DMA_IOVA_COOKIE */
 	struct iova_domain iovad;
 };
