@@ -5,8 +5,15 @@
  */
 
 #include <linux/dma-map-ops.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
+#include <linux/err.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 
 #include "rknpu_iommu.h"
+
+#define RKNPU_SWITCH_DOMAIN_WAIT_TIME_MS 6000
 
 dma_addr_t rknpu_iommu_dma_alloc_iova(struct iommu_domain *domain, size_t size,
 				      u64 dma_limit, struct device *dev,
@@ -360,16 +367,14 @@ void rknpu_iommu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
 	}
 }
 
-#if defined(CONFIG_IOMMU_API) && defined(CONFIG_NO_GKI)
+#if defined(CONFIG_IOMMU_API)
 
 #if KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE
 struct iommu_group {
 	struct kobject kobj;
 	struct kobject *devices_kobj;
 	struct list_head devices;
-#ifdef __ANDROID_COMMON_KERNEL__
 	struct xarray pasid_array;
-#endif
 	struct mutex mutex;
 	void *iommu_data;
 	void (*iommu_data_release)(void *iommu_data);
@@ -380,6 +385,7 @@ struct iommu_group {
 	struct iommu_domain *domain;
 	struct list_head entry;
 	unsigned int owner_cnt;
+	unsigned int recovery_cnt;
 	void *owner;
 };
 #else
@@ -415,7 +421,6 @@ int rknpu_iommu_switch_domain(struct rknpu_device *rknpu_dev, int domain_id)
 {
 	struct iommu_domain *src_domain = NULL;
 	struct iommu_domain *dst_domain = NULL;
-	struct bus_type *bus = NULL;
 	int src_domain_id = 0;
 	int ret = -EINVAL;
 
@@ -430,24 +435,15 @@ int rknpu_iommu_switch_domain(struct rknpu_device *rknpu_dev, int domain_id)
 		return -EINVAL;
 	}
 
-	bus = rknpu_dev->dev->bus;
-	if (!bus)
-		return -EFAULT;
-
-	mutex_lock(&rknpu_dev->domain_lock);
-
 	src_domain_id = rknpu_dev->iommu_domain_id;
-	if (domain_id == src_domain_id) {
-		mutex_unlock(&rknpu_dev->domain_lock);
+	if (domain_id == src_domain_id)
 		return 0;
-	}
 
 	src_domain = iommu_get_domain_for_dev(rknpu_dev->dev);
 	if (src_domain != rknpu_dev->iommu_domains[src_domain_id]) {
 		LOG_DEV_ERROR(
 			rknpu_dev->dev,
 			"mismatch domain get from iommu_get_domain_for_dev\n");
-		mutex_unlock(&rknpu_dev->domain_lock);
 		return -EINVAL;
 	}
 
@@ -466,22 +462,26 @@ int rknpu_iommu_switch_domain(struct rknpu_device *rknpu_dev, int domain_id)
 					"failed to reattach src iommu domain, id: %d\n",
 					src_domain_id);
 			}
-			mutex_unlock(&rknpu_dev->domain_lock);
 			return ret;
 		}
 		rknpu_dev->iommu_domain_id = domain_id;
 	} else {
-		uint64_t dma_limit = 1ULL << 32;
+		struct rknpu_iommu_dma_cookie *cookie = NULL;
 
-		dst_domain = iommu_domain_alloc(bus);
-		if (!dst_domain) {
+		dst_domain = iommu_paging_domain_alloc(rknpu_dev->dev);
+		if (IS_ERR(dst_domain)) {
 			LOG_DEV_ERROR(rknpu_dev->dev,
 				      "failed to allocate iommu domain\n");
-			mutex_unlock(&rknpu_dev->domain_lock);
 			return -EIO;
 		}
-		// init domain iova_cookie
-		iommu_get_dma_cookie(dst_domain);
+
+		cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+		if (!cookie) {
+			iommu_domain_free(dst_domain);
+			return -ENOMEM;
+		}
+		init_iova_domain(&cookie->iovad, SZ_4K, 1);
+		dst_domain->iova_cookie = (void *)cookie;
 
 		iommu_detach_device(src_domain, rknpu_dev->dev);
 		ret = iommu_attach_device(dst_domain, rknpu_dev->dev);
@@ -490,52 +490,128 @@ int rknpu_iommu_switch_domain(struct rknpu_device *rknpu_dev, int domain_id)
 				rknpu_dev->dev,
 				"failed to attach iommu domain, id: %d, ret: %d\n",
 				domain_id, ret);
+			dst_domain->iova_cookie = NULL;
+			put_iova_domain(&cookie->iovad);
+			kfree(cookie);
 			iommu_domain_free(dst_domain);
-			mutex_unlock(&rknpu_dev->domain_lock);
 			return ret;
 		}
-
-		// set domain type to dma domain
-		dst_domain->type |= __IOMMU_DOMAIN_DMA_API;
-		// iommu dma init domain
-		iommu_setup_dma_ops(rknpu_dev->dev, 0, dma_limit);
 
 		rknpu_dev->iommu_domain_id = domain_id;
 		rknpu_dev->iommu_domains[domain_id] = dst_domain;
 		rknpu_dev->iommu_domain_num++;
 	}
 
-	// reset default iommu domain
 	rknpu_dev->iommu_group->default_domain = dst_domain;
 
-	mutex_unlock(&rknpu_dev->domain_lock);
-
-	LOG_INFO("switch iommu domain from %d to %d\n", src_domain_id,
+	LOG_DEBUG("switch iommu domain from %d to %d\n", src_domain_id,
 		 domain_id);
 
 	return ret;
+}
+
+int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
+				      int domain_id)
+{
+	unsigned long timeout_jiffies =
+		msecs_to_jiffies(RKNPU_SWITCH_DOMAIN_WAIT_TIME_MS);
+	unsigned long start = jiffies;
+	int ret = -EINVAL;
+
+	if (!rknpu_dev->iommu_en)
+		return 0;
+
+	while (true) {
+		mutex_lock(&rknpu_dev->domain_lock);
+
+		if (domain_id == rknpu_dev->iommu_domain_id) {
+			atomic_inc(&rknpu_dev->iommu_domain_refcount);
+			mutex_unlock(&rknpu_dev->domain_lock);
+			break;
+		}
+
+		if (atomic_read(&rknpu_dev->iommu_domain_refcount) == 0) {
+			ret = rknpu_iommu_switch_domain(rknpu_dev, domain_id);
+			if (ret) {
+				LOG_DEV_ERROR(
+					rknpu_dev->dev,
+					"failed to switch iommu domain, id: %d, ret: %d\n",
+					domain_id, ret);
+				mutex_unlock(&rknpu_dev->domain_lock);
+				return ret;
+			}
+			atomic_inc(&rknpu_dev->iommu_domain_refcount);
+			mutex_unlock(&rknpu_dev->domain_lock);
+			break;
+		}
+
+		mutex_unlock(&rknpu_dev->domain_lock);
+
+		usleep_range(10, 100);
+		if (time_after(jiffies, start + timeout_jiffies)) {
+			LOG_DEV_ERROR(
+				rknpu_dev->dev,
+				"switch iommu domain time out, id: %d\n",
+				domain_id);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+int rknpu_iommu_domain_put(struct rknpu_device *rknpu_dev)
+{
+	if (!rknpu_dev->iommu_en)
+		return 0;
+
+	atomic_dec(&rknpu_dev->iommu_domain_refcount);
+
+	return 0;
 }
 
 void rknpu_iommu_free_domains(struct rknpu_device *rknpu_dev)
 {
 	int i = 0;
 
-	rknpu_iommu_switch_domain(rknpu_dev, 0);
+	if (rknpu_iommu_domain_get_and_switch(rknpu_dev, 0)) {
+		LOG_DEV_ERROR(rknpu_dev->dev, "%s error\n", __func__);
+		return;
+	}
 
 	for (i = 1; i < RKNPU_MAX_IOMMU_DOMAIN_NUM; i++) {
 		struct iommu_domain *domain = rknpu_dev->iommu_domains[i];
+		struct rknpu_iommu_dma_cookie *cookie;
 
 		if (domain == NULL)
 			continue;
 
-		iommu_detach_device(domain, rknpu_dev->dev);
+		cookie = (void *)domain->iova_cookie;
+		domain->iova_cookie = NULL;
 		iommu_domain_free(domain);
+		if (cookie) {
+			put_iova_domain(&cookie->iovad);
+			kfree(cookie);
+		}
 
 		rknpu_dev->iommu_domains[i] = NULL;
 	}
+
+	rknpu_iommu_domain_put(rknpu_dev);
 }
 
 #else
+
+int rknpu_iommu_domain_get_and_switch(struct rknpu_device *rknpu_dev,
+				      int domain_id)
+{
+	return 0;
+}
+
+int rknpu_iommu_domain_put(struct rknpu_device *rknpu_dev)
+{
+	return 0;
+}
 
 int rknpu_iommu_init_domain(struct rknpu_device *rknpu_dev)
 {

@@ -486,8 +486,11 @@ static int rknpu_action(struct rknpu_device *rknpu_dev,
 		ret = 0;
 		break;
 	case RKNPU_SET_IOMMU_DOMAIN_ID: {
-		ret = rknpu_iommu_switch_domain(rknpu_dev,
-						*(int32_t *)&args->value);
+		ret = rknpu_iommu_domain_get_and_switch(
+			rknpu_dev, *(int32_t *)&args->value);
+		if (ret)
+			break;
+		rknpu_iommu_domain_put(rknpu_dev);
 		break;
 	}
 	default:
@@ -1345,6 +1348,7 @@ static int rknpu_probe(struct platform_device *pdev)
 	mutex_init(&rknpu_dev->power_lock);
 	mutex_init(&rknpu_dev->reset_lock);
 	mutex_init(&rknpu_dev->domain_lock);
+	atomic_set(&rknpu_dev->iommu_domain_refcount, 0);
 	for (i = 0; i < config->num_irqs; i++) {
 		INIT_LIST_HEAD(&rknpu_dev->subcore_datas[i].todo_list);
 		init_waitqueue_head(&rknpu_dev->subcore_datas[i].job_done_wq);

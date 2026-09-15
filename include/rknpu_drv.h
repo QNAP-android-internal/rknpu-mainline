@@ -171,6 +171,7 @@ struct rknpu_device {
 	int iommu_domain_num;
 	int iommu_domain_id;
 	struct iommu_domain *iommu_domains[RKNPU_MAX_IOMMU_DOMAIN_NUM];
+	atomic_t iommu_domain_refcount;
 	struct sg_table *cache_sgt[RKNPU_CACHE_SG_TABLE_NUM];
 };
 

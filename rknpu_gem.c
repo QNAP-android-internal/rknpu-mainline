@@ -693,8 +693,13 @@ rknpu_gem_object_create(struct drm_device *drm, unsigned int flags,
 	if (IS_ERR(rknpu_obj))
 		return rknpu_obj;
 
-	if (!rknpu_iommu_switch_domain(rknpu_dev, iommu_domain_id))
-		rknpu_obj->iommu_domain_id = iommu_domain_id;
+	if (rknpu_iommu_domain_get_and_switch(rknpu_dev, iommu_domain_id)) {
+		LOG_DEV_ERROR(rknpu_dev->dev, "%s error\n", __func__);
+		rknpu_gem_release(rknpu_obj);
+		return ERR_PTR(-EINVAL);
+	}
+
+	rknpu_obj->iommu_domain_id = iommu_domain_id;
 
 	if (!rknpu_dev->iommu_en && (flags & RKNPU_MEM_NON_CONTIGUOUS)) {
 		/*
@@ -786,6 +791,8 @@ rknpu_gem_object_create(struct drm_device *drm, unsigned int flags,
 			goto gem_release;
 	}
 
+	rknpu_iommu_domain_put(rknpu_dev);
+
 	LOG_DEBUG(
 		"created dma addr: %pad, cookie: %p, ddr size: %lu, sram size: %lu, nbuf size: %lu, attrs: %#lx, flags: %#x, iommu domain id: %d\n",
 		&rknpu_obj->dma_addr, rknpu_obj->cookie, rknpu_obj->size,
@@ -803,6 +810,8 @@ mm_free:
 gem_release:
 	rknpu_gem_release(rknpu_obj);
 
+	rknpu_iommu_domain_put(rknpu_dev);
+
 	return ERR_PTR(ret);
 }
 
@@ -810,13 +819,25 @@ void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 {
 	struct drm_gem_object *obj = &rknpu_obj->base;
 	struct rknpu_device *rknpu_dev = obj->dev->dev_private;
+	int wait_count = 0;
+	int ret = -EINVAL;
 
 	LOG_DEBUG(
 		"destroy dma addr: %pad, cookie: %p, size: %lu, attrs: %#lx, flags: %#x, handle count: %d\n",
 		&rknpu_obj->dma_addr, rknpu_obj->cookie, rknpu_obj->size,
 		rknpu_obj->dma_attrs, rknpu_obj->flags, obj->handle_count);
 
-	rknpu_iommu_switch_domain(rknpu_dev, rknpu_obj->iommu_domain_id);
+	do {
+		ret = rknpu_iommu_domain_get_and_switch(
+			rknpu_dev, rknpu_obj->iommu_domain_id);
+		if (ret && ++wait_count >= 3) {
+			LOG_DEV_ERROR(
+				rknpu_dev->dev,
+				"failed to destroy dma addr: %pad, size: %lu\n",
+				&rknpu_obj->dma_addr, rknpu_obj->size);
+			return;
+		}
+	} while (ret);
 
 	/*
 	 * do not release memory region from exporter.
@@ -845,6 +866,7 @@ void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 	}
 
 	rknpu_gem_release(rknpu_obj);
+	rknpu_iommu_domain_put(rknpu_dev);
 }
 
 int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
@@ -901,16 +923,30 @@ int rknpu_gem_destroy_ioctl(struct drm_device *drm, void *data,
 	struct rknpu_device *rknpu_dev = drm->dev_private;
 	struct rknpu_gem_object *rknpu_obj = NULL;
 	struct rknpu_mem_destroy *args = data;
+	int ret = 0;
+	int wait_count = 0;
 
 	rknpu_obj = rknpu_gem_object_find(file_priv, args->handle);
 	if (!rknpu_obj)
 		return -EINVAL;
 
-	rknpu_iommu_switch_domain(rknpu_dev, rknpu_obj->iommu_domain_id);
+	do {
+		ret = rknpu_iommu_domain_get_and_switch(
+			rknpu_dev, rknpu_obj->iommu_domain_id);
+		if (ret && ++wait_count >= 3) {
+			LOG_DEV_ERROR(rknpu_dev->dev,
+				      "failed to destroy memory\n");
+			return ret;
+		}
+	} while (ret);
 
 	// rknpu_gem_object_put(&rknpu_obj->base);
 
-	return rknpu_gem_handle_destroy(file_priv, args->handle);
+	ret = rknpu_gem_handle_destroy(file_priv, args->handle);
+
+	rknpu_iommu_domain_put(rknpu_dev);
+
+	return ret;
 }
 
 #if RKNPU_GEM_ALLOC_FROM_PAGES
