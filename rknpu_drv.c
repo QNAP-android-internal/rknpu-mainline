@@ -68,6 +68,11 @@ module_param(bypass_soft_reset, int, 0644);
 MODULE_PARM_DESC(bypass_soft_reset,
 		 "bypass RKNPU soft reset if set it to 1, disabled by default");
 
+static unsigned long npu_rate;
+module_param(npu_rate, ulong, 0644);
+MODULE_PARM_DESC(npu_rate,
+		 "if non-zero, clk_set_rate the NPU clk (clks[0]) to this many Hz on power-on (runtime DVFS-free freq bump)");
+
 static const struct rknpu_irqs_data rknpu_irqs[] = {
 	{ "npu_irq", rknpu_core0_irq_handler }
 };
@@ -924,6 +929,14 @@ static int rknpu_power_on(struct rknpu_device *rknpu_dev)
 		LOG_DEV_ERROR(dev, "failed to enable clk for rknpu, ret: %d\n",
 			      ret);
 		return ret;
+	}
+
+	if (npu_rate && rknpu_dev->num_clks > 0) {
+		int rr = clk_set_rate(rknpu_dev->clks[0].clk, npu_rate);
+		if (rr)
+			LOG_DEV_WARN(dev, "npu_rate: clk_set_rate(%lu) failed: %d\n", npu_rate, rr);
+		else
+			LOG_DEV_INFO(dev, "npu_rate: NPU clk set to %lu Hz\n", npu_rate);
 	}
 
 #ifndef FPGA_PLATFORM
