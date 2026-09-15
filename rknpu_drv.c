@@ -1266,6 +1266,11 @@ static int rknpu_probe(struct platform_device *pdev)
 	rknpu_dev->dev = dev;
 	dev_set_drvdata(dev, rknpu_dev);
 
+	if (dma_set_mask_and_coherent(dev, config->dma_mask))
+		LOG_DEV_WARN(dev, "failed to set dma mask %#llx\n",
+			     config->dma_mask);
+	dev->bus_dma_limit = 0;
+
 	rknpu_dev->iommu_en = rknpu_is_iommu_enable(dev);
 	if (rknpu_dev->iommu_en) {
 		rknpu_dev->iommu_group = iommu_group_get(dev);

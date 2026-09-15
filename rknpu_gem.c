@@ -189,8 +189,7 @@ static int rknpu_gem_alloc_buf(struct rknpu_gem_object *rknpu_obj)
 	if (rknpu_obj->flags & RKNPU_MEM_ZEROING)
 		gfp_mask |= __GFP_ZERO;
 
-	if (!rknpu_dev->iommu_en ||
-	    rknpu_dev->config->dma_mask <= DMA_BIT_MASK(32) ||
+	if (rknpu_dev->config->dma_mask <= DMA_BIT_MASK(32) ||
 	    (rknpu_obj->flags & RKNPU_MEM_DMA32)) {
 		gfp_mask &= ~__GFP_HIGHMEM;
 		gfp_mask |= __GFP_DMA32;
