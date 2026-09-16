@@ -68,6 +68,8 @@ module_param(bypass_soft_reset, int, 0644);
 MODULE_PARM_DESC(bypass_soft_reset,
 		 "bypass RKNPU soft reset if set it to 1, disabled by default");
 
+#define RKNPU_POWER_DOWN_FREQ 200000000UL
+
 static unsigned long npu_rate;
 module_param(npu_rate, ulong, 0644);
 MODULE_PARM_DESC(npu_rate,
@@ -934,14 +936,6 @@ static int rknpu_power_on(struct rknpu_device *rknpu_dev)
 		return ret;
 	}
 
-	if (npu_rate && rknpu_dev->num_clks > 0) {
-		int rr = clk_set_rate(rknpu_dev->clks[0].clk, npu_rate);
-		if (rr)
-			LOG_DEV_WARN(dev, "npu_rate: clk_set_rate(%lu) failed: %d\n", npu_rate, rr);
-		else
-			LOG_DEV_INFO(dev, "npu_rate: NPU clk set to %lu Hz\n", npu_rate);
-	}
-
 #ifndef FPGA_PLATFORM
 	rknpu_devfreq_lock(rknpu_dev);
 #endif
@@ -1000,6 +994,18 @@ static int rknpu_power_on(struct rknpu_device *rknpu_dev)
 			      ret);
 	}
 
+	if (npu_rate && rknpu_dev->num_clks > 0) {
+		int rr = clk_set_rate(rknpu_dev->clks[0].clk, npu_rate);
+
+		if (rr)
+			LOG_DEV_WARN(dev,
+				     "npu_rate: clk_set_rate(%lu) failed: %d\n",
+				     npu_rate, rr);
+		else
+			LOG_DEV_INFO(dev, "npu_rate: NPU clk set to %lu Hz\n",
+				     clk_get_rate(rknpu_dev->clks[0].clk));
+	}
+
 	if (rknpu_dev->config->state_init != NULL)
 		rknpu_dev->config->state_init(rknpu_dev);
 
@@ -1018,6 +1024,9 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
 #ifndef FPGA_PLATFORM
 	rknpu_devfreq_lock(rknpu_dev);
 #endif
+
+	if (npu_rate && rknpu_dev->num_clks > 0)
+		clk_set_rate(rknpu_dev->clks[0].clk, RKNPU_POWER_DOWN_FREQ);
 
 	pm_runtime_put_sync(dev);
 
